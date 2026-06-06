@@ -14,6 +14,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }()
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        // 앱 아이콘을 메뉴바 아이콘과 동일한 파란 팬으로 설정
+        // → NSAlert(데몬 설치/About/제어 에러) 의 좌측 아이콘이 폴더 아이콘이 아니라 팬 아이콘으로 표시됨
+        NSApp.applicationIconImage = makeFanIcon(size: 256)
         setupStatusItem()
         setupPopover()
         scheduleTimer()
@@ -43,16 +46,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // Core Graphics로 파란색 팬 아이콘 생성
-    private func makeFanIcon() -> NSImage {
-        let size: CGFloat = 16
+    // Core Graphics로 파란색 팬 아이콘 생성 (메뉴바·앱 아이콘 공용)
+    // size: 출력 픽셀 크기. 내부 path는 16pt 기준으로 그려두고 CGContext 스케일로 확대.
+    private func makeFanIcon(size: CGFloat = 16) -> NSImage {
         let img = NSImage(size: NSSize(width: size, height: size))
         img.lockFocus()
 
         guard let ctx = NSGraphicsContext.current?.cgContext else {
             img.unlockFocus(); return img
         }
+        // 16pt 기준 path → 실제 크기로 균일 스케일
+        let s = size / 16.0
         ctx.translateBy(x: size/2, y: size/2)
+        ctx.scaleBy(x: s, y: s)
 
         let blue = NSColor.systemBlue.cgColor
 
