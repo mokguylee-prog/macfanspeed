@@ -7,6 +7,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menuView: MenuView!
     private var timer: Timer?
     private let fan = FanManager.shared
+    // NSAlert에 직접 꽂아줄 큰 사이즈 팬 아이콘 (한번만 생성해 재사용)
+    private lazy var appIcon: NSImage = makeFanIcon(size: 256)
 
     static let version: String = {
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
@@ -14,9 +16,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }()
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        // 앱 아이콘을 메뉴바 아이콘과 동일한 파란 팬으로 설정
-        // → NSAlert(데몬 설치/About/제어 에러) 의 좌측 아이콘이 폴더 아이콘이 아니라 팬 아이콘으로 표시됨
-        NSApp.applicationIconImage = makeFanIcon(size: 256)
+        // 앱 아이콘 설정 (NSAlert 자동 사용 + Cmd-Tab 등)
+        NSApp.applicationIconImage = appIcon
+        // Finder 에서 보이는 실행파일 아이콘도 팬 아이콘으로 설정
+        // (단일 실행파일은 기본 'exec' 아이콘으로 표시됨)
+        if let exePath = Bundle.main.executablePath {
+            NSWorkspace.shared.setIcon(makeFanIcon(size: 512), forFile: exePath, options: [])
+        }
         setupStatusItem()
         setupPopover()
         scheduleTimer()
@@ -127,6 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func promptDaemonInstall() {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
+        a.icon = appIcon
         a.messageText = "FanSpeed 최초 설정"
         a.informativeText = """
         팬 속도를 비밀번호 없이 즉시 조절하려면
@@ -142,6 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let ok = fan.installDaemon()
         NSApp.activate(ignoringOtherApps: true)
         let b = NSAlert()
+        b.icon = appIcon
         b.messageText      = ok ? "설치 완료 ✓" : "설치 취소"
         b.informativeText  = ok
             ? "이제 비밀번호 없이 즉시 팬 속도를 조절할 수 있습니다."
@@ -162,6 +170,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showControlError() {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
+        a.icon = appIcon
         a.messageText = "팬 속도 설정"
         a.informativeText = """
         관리자 권한이 필요합니다.
@@ -204,6 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showAbout() {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
+        a.icon = appIcon
         a.messageText = "FanSpeed"
         a.informativeText = """
         macOS 팬 속도 제어 메뉴바 앱
