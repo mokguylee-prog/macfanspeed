@@ -178,3 +178,72 @@ Xcode 불필요, `swiftc` CLI로 컴파일.
 |------|------|-----------|
 | v0.1 | 2026-06-07 | 초기 완성. SMC 읽기 버그(구조체 패딩) 수정, FS!/F0Tg 제어 구현 |
 | v0.2 | 2026-06-07 | 파란 아이콘, 메뉴바 RPM 표시, 팝오버 즉시 표시, 최초 데몬 자동 설치 안내, 텍스트 잘림 수정 |
+| v0.2.1 | 2026-06-07 | 슬라이더 1 RPM 미세 조절, 중복 실행 차단, 데몬 폴링 0.3초로 단축, sticky-dir IPC 버그 수정 |
+
+---
+
+## 9. 비밀번호 1회 원칙 (Authentication-Once Design)
+
+### 9-1. 왜 어려운 문제인가
+
+SMC 쓰기(`FS!`, `F0Tg`)는 root 권한이 필요하다.
+- macOS는 일반 사용자가 SMC에 쓰는 것을 차단한다.
+- 매번 쓸 때마다 `osascript ... with administrator privileges` 를 호출하면 사용자가 슬라이더를 움직일 때마다 비밀번호 다이얼로그가 뜬다. → 사용성 0.
+
+### 9-2. 해결: 권한 분리 + 파일 IPC
+
+GUI 앱(사용자 권한)과 SMC 쓰기 권한(root)을 **시간적으로 분리**한다.
+
+```
+                                  ┌─────────────────────────┐
+사용자가 슬라이더 조작              │ root 데몬 (LaunchDaemon) │
+      │                           │  부팅 시 자동 시작        │
+      │ 1. 파일에 RPM 쓰기         │  무한 폴링 루프           │
+      ▼                           │                          │
+  /Users/Shared/.fanspeed_target  │  2. 파일 변경 감지 →     │
+  (chmod 666)                ◄───►│     SMC 쓰기              │
+                                  └─────────────────────────┘
+```
+
+- **1회만 비밀번호 입력**: 최초 데몬 설치 시 `osascript ... with administrator privileges` 로 1번. 이후 LaunchDaemon이 부팅마다 자동 root 실행.
+- **이후 모든 제어는 파일 쓰기**: 일반 사용자 권한으로 666 파일에 RPM을 write → 데몬이 0.3초 폴링으로 감지 → root 권한으로 SMC에 반영.
+
+### 9-3. 단일 바이너리 3-모드 분기
+
+같은 실행 파일이 인자에 따라 GUI/데몬/CLI 세 가지 역할을 한다.
+
+```swift
+// main.swift
+if args.contains("--daemon")        { FanManager.runDaemon() }   // root, 무한 루프
+if args.contains("--smc-set")       { exit(FanManager.runCLI(...)) } // root, 1회 쓰기
+// 그 외: GUI 메뉴바 앱
+```
+
+데몬 설치 시 동일 바이너리를 `/usr/local/bin/fanspeed-helper` 로 복사하고 `--daemon` 인자로 LaunchDaemon 등록. 별도의 helper 프로젝트가 필요 없다.
+
+### 9-4. ⚠️ 함정: sticky 디렉토리에서 atomically:true 사용 금지
+
+`/Users/Shared/` 은 sticky 디렉토리(`drwxrwxrwt`)이고 타겟 파일 소유자는 root다.
+Swift 의 `String.write(toFile:atomically:true,...)` 는 내부적으로 **임시파일 생성 후 rename(2)** 으로 덮어쓴다. 그런데 **sticky 디렉토리에서는 자신이 소유하지 않은 파일을 rename으로 덮어쓸 수 없다 (EPERM)**.
+
+결과: 매 commit 마다 write 실패 → `commit()` 이 `false` → fallback 으로 osascript 다이얼로그가 매번 뜸. ("비밀번호 1회 원칙" 완전 붕괴, 실사용 불가능.)
+
+**올바른 구현**:
+```swift
+// ❌ atomically:true — sticky dir에서 EPERM
+try payload.write(toFile: target, atomically: true, encoding: .utf8)
+
+// ✅ in-place 쓰기 (파일 권한 666 보장 시)
+if let fh = FileHandle(forWritingAtPath: target) {
+    try fh.truncate(atOffset: 0)
+    try fh.write(contentsOf: data)
+}
+```
+
+설치 스크립트는 반드시 `chmod 666 /Users/Shared/.fanspeed_target` 을 보장해야 한다.
+
+### 9-5. 중복 실행 차단
+
+LaunchAgent 의 `RunAtLoad: true` 가 등록 즉시 같은 앱을 한 번 더 띄운다. 사용자가 수동 실행한 인스턴스와 LaunchAgent 가 띄운 인스턴스가 모두 살아 있으면 두 GUI 가 떠 있게 된다.
+
+`main.swift` 진입 시 `NSWorkspace.runningApplications` 로 같은 실행파일명을 가진 다른 PID 가 있으면 즉시 `exit(0)`. 데몬은 helper 바이너리(이름이 다름)이므로 이 검사에 걸리지 않는다.
