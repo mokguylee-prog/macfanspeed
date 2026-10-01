@@ -7,6 +7,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menuView: MenuView!
     private var timer: Timer?
     private let fan = FanManager.shared
+    private let sensorQueue = DispatchQueue(label: "com.fanspeed.sensors", qos: .utility)
+    private var didOfferHelper = false
     // NSAlert에 직접 꽂아줄 큰 사이즈 팬 아이콘 (한번만 생성해 재사용)
     private lazy var appIcon: NSImage = makeFanIcon(size: 256)
 
@@ -27,12 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupPopover()
         scheduleTimer()
         // 자동 시작은 사용자가 토글로 명시 활성화할 때만 등록 (강제 등록 X)
-        // 데몬 미설치 → 0.8초 후 최초 설정 안내
-        if !fan.daemonInstalled {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-                self?.promptDaemonInstall()
-            }
-        }
+        // 읽기만 할 때는 데몬이나 관리자 권한이 필요하지 않다.
     }
 
     // MARK: - StatusItem (메뉴바 아이콘 + RPM)
@@ -100,12 +97,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Popover (애니메이션 없이 즉시 표시)
 
     private func setupPopover() {
-        let mn = fan.fanMinRPM ?? 1200
-        let mx = fan.fanMaxRPM ?? 6200
-        menuView = MenuView(minRPM: mn, maxRPM: mx, autoStartOn: fan.autoStartEnabled)
+        menuView = MenuView(minRPM: fan.minRPM, maxRPM: fan.maxRPM,
+                            autoStartOn: fan.autoStartEnabled, model: fan.model)
 
         menuView.onControl   = { [weak self] auto, rpm in self?.applyControl(auto: auto, rpm: rpm) }
         menuView.onAutoStart = { [weak self] on in self?.fan.setAutoStart(on) ?? false }
+        menuView.onModelChange = { [weak self] model in
+            guard let self else { return false }
+            guard self.fan.selectModel(model) else { self.showControlError(); return false }
+            self.refreshReadout()
+            return true
+        }
         menuView.onAbout     = { [weak self] in self?.showAbout() }
         menuView.onQuit      = { [weak self] in self?.safeQuit() }
 
@@ -134,7 +136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
         a.icon = appIcon
-        a.messageText = "FanSpeed 최초 설정"
+        a.messageText = fan.daemonNeedsUpdate ? "FanSpeed 도우미 업데이트" : "FanSpeed 최초 설정"
         a.informativeText = """
         팬 속도를 비밀번호 없이 즉시 조절하려면
         백그라운드 도우미를 한 번만 설치해야 합니다.
@@ -161,24 +163,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 팬 제어
 
     private func applyControl(auto: Bool, rpm: Int) {
+        if !auto && !fan.daemonInstalled && !didOfferHelper {
+            didOfferHelper = true
+            promptDaemonInstall()
+        }
         let ok = fan.commit(auto: auto, rpm: rpm)
-        if !ok && !auto {
+        if !ok {
+            menuView.resetControl()
             DispatchQueue.main.async { [weak self] in self?.showControlError() }
         }
+        refreshReadout()
     }
 
     private func showControlError() {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
         a.icon = appIcon
-        a.messageText = "팬 속도 설정"
+        a.messageText = "팬 속도를 적용하지 못했습니다"
         a.informativeText = """
-        관리자 권한이 필요합니다.
-        비밀번호를 입력하거나 데몬을 설치하면
-        이후엔 비밀번호 없이 제어됩니다.
+        선택한 모델: \(fan.model.title)
+
+        모델 선택과 관리자 권한을 확인해 주세요.
+        macOS 또는 펌웨어가 수동 제어를 허용하지 않을 수도 있습니다.
+        팬 속도와 온도 표시는 도우미 없이 사용할 수 있습니다.
         """
         a.alertStyle = .informational
-        a.addButton(withTitle: "데몬 설치 (1회만)")
+        a.addButton(withTitle: fan.daemonNeedsUpdate ? "도우미 업데이트" : "도우미 설치")
         a.addButton(withTitle: "나중에")
         if a.runModal() == .alertFirstButtonReturn { promptDaemonInstall() }
     }
@@ -186,24 +196,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 타이머 (백그라운드 SMC 읽기 → 메인 UI 업데이트)
 
     private func scheduleTimer() {
-        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             self?.refreshReadout()
         }
-        timer?.tolerance = 1
+        timer?.tolerance = 0.4
         refreshReadout()
     }
 
     private func refreshReadout() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        sensorQueue.async { [weak self] in
             guard let self else { return }
-            let rpm  = self.fan.currentRPM()
-            let temp = self.fan.cpuTemp()
+            let readout = self.fan.readout()
             DispatchQueue.main.async {
-                self.menuView?.updateReadout(currentRPM: rpm, temp: temp)
-                // 메뉴바: 아이콘 + RPM + 온도
-                let tempStr = temp.map { String(format: "%.0f°C", $0) } ?? "--"
-                self.statusItem.button?.title = "  \(rpm)  \(tempStr)"
-                self.statusItem.button?.toolTip = "\(rpm) RPM · \(tempStr)"
+                guard readout.model == self.fan.model else { return }
+                self.menuView?.updateReadout(readout)
+                let tempStr = readout.temperature.map { String(format: "%.0f°C", $0) } ?? "—°C"
+                let rpmStr = readout.fanCount == 0 ? readout.rpmText : "\(readout.rpmText) RPM"
+                self.statusItem.button?.title = "  \(rpmStr)  \(tempStr)"
+                self.statusItem.button?.toolTip = "\(readout.model.title)\n\(readout.fanText)\nCPU \(tempStr)"
             }
         }
     }
@@ -219,7 +229,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         macOS 팬 속도 제어 메뉴바 앱
 
         만든이: 월평동 이상목
-        버전: v0.2  (\(Self.version))
+        버전: v0.3  (\(Self.version))
         """
         a.alertStyle = .informational
         a.addButton(withTitle: "확인")
@@ -229,14 +239,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 종료
 
     private func safeQuit() {
-        fan.commit(auto: true, rpm: 0)
+        if fan.hasIssuedControl { fan.commit(auto: true, rpm: 0) }
         NSApp.terminate(nil)
     }
-}
-
-// MARK: - FanManager 편의 확장
-
-extension FanManager {
-    var fanMinRPM: Int? { minRPM > 0 ? minRPM : nil }
-    var fanMaxRPM: Int? { maxRPM > 0 ? maxRPM : nil }
 }

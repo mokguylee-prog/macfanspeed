@@ -1,5 +1,21 @@
 import Foundation
 import IOKit
+import Darwin
+
+enum MacModel: String, CaseIterable {
+    case new
+    case legacy
+
+    static var detected: MacModel {
+        // 실제 하드웨어를 확인하므로 Rosetta로 실행해도 Apple Silicon을 인식한다.
+        var arm64: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        return sysctlbyname("hw.optional.arm64", &arm64, &size, nil, 0) == 0 && arm64 == 1
+            ? .new : .legacy
+    }
+
+    var title: String { self == .new ? "New 모델 · Apple Silicon" : "이전 모델 · Intel" }
+}
 
 // MARK: - SMC C 구조체 (C 레이아웃과 정확히 일치해야 함, 총 80바이트)
 
@@ -55,6 +71,54 @@ struct SMCVal {
     var dataSize: UInt32
     var dataType: UInt32
     var bytes: [UInt8]
+
+    var typeName: String {
+        String(bytes: (0..<4).map { UInt8((dataType >> (8 * (3 - $0))) & 0xff) },
+               encoding: .ascii) ?? ""
+    }
+
+    // SMC 키의 실제 타입을 사용한다. 0은 팬 정지 상태일 수 있으므로 유효한 값이다.
+    var number: Double? {
+        guard bytes.count == Int(dataSize) else { return nil }
+        let value: Double
+        switch (typeName, bytes.count) {
+        case ("flt ", 4):
+            let bits = bytes.enumerated().reduce(UInt32(0)) {
+                $0 | (UInt32($1.element) << ($1.offset * 8))
+            }
+            value = Double(Float(bitPattern: bits))
+        case ("fpe2", 2):
+            value = Double(UInt16(bytes[0]) << 8 | UInt16(bytes[1])) / 4
+        case ("sp78", 2):
+            let raw = UInt16(bytes[0]) << 8 | UInt16(bytes[1])
+            value = Double(Int16(bitPattern: raw)) / 256
+        case ("ui8 ", 1), ("ui16", 2), ("ui32", 4):
+            value = Double(bytes.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) })
+        default:
+            return nil
+        }
+        return value.isFinite ? value : nil
+    }
+
+    func encoding(_ value: Double) -> [UInt8]? {
+        guard value.isFinite, value >= 0 else { return nil }
+        switch (typeName, dataSize) {
+        case ("flt ", 4):
+            let float = Float(value)
+            guard float.isFinite else { return nil }
+            let bits = float.bitPattern
+            return (0..<4).map { UInt8((bits >> ($0 * 8)) & 0xff) }
+        case ("fpe2", 2):
+            guard value <= Double(UInt16.max) / 4 else { return nil }
+            let raw = UInt16((value * 4).rounded())
+            return [UInt8(raw >> 8), UInt8(raw & 0xff)]
+        case ("ui8 ", 1):
+            guard value <= 255, value.rounded() == value else { return nil }
+            return [UInt8(value)]
+        default:
+            return nil
+        }
+    }
 }
 
 // MARK: - SMCKit
@@ -63,12 +127,18 @@ final class SMCKit {
     static let shared = SMCKit()
     private var conn: io_connect_t = 0
     private(set) var isOpen = false
+    private let lock = NSRecursiveLock()
+    private var cachedKeys: [String]?
+    private var cpuKeys: [String]?
 
     private init() { open() }
     deinit { close() }
 
     private func open() {
-        let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
+        let port: mach_port_t
+        if #available(macOS 12.0, *) { port = kIOMainPortDefault }
+        else { port = kIOMasterPortDefault }
+        let svc = IOServiceGetMatchingService(port, IOServiceMatching("AppleSMC"))
         guard svc != 0 else { return }
         let r = IOServiceOpen(svc, mach_task_self_, 0, &conn)
         IOObjectRelease(svc)
@@ -100,6 +170,7 @@ final class SMCKit {
     // MARK: 읽기
 
     func read(_ key: String) -> SMCVal? {
+        lock.lock(); defer { lock.unlock() }
         guard isOpen else { return nil }
         var input = SMCKeyData()
         var output = SMCKeyData()
@@ -108,7 +179,7 @@ final class SMCKit {
         input.data8 = SMC_CMD_READ_KEYINFO
         guard call(&input, &output) == kIOReturnSuccess else { return nil }
         // result != 0 또는 dataSize == 0 이면 키 없음
-        guard output.result == 0, output.keyInfo.dataSize > 0 else { return nil }
+        guard output.result == 0, (1...32).contains(output.keyInfo.dataSize) else { return nil }
 
         let size = output.keyInfo.dataSize
         let type = output.keyInfo.dataType
@@ -128,6 +199,7 @@ final class SMCKit {
 
     @discardableResult
     func write(_ key: String, bytes: [UInt8]) -> Bool {
+        lock.lock(); defer { lock.unlock() }
         guard isOpen else { return false }
         var input = SMCKeyData()
         var output = SMCKeyData()
@@ -135,7 +207,8 @@ final class SMCKit {
         input.key = fourCC(key)
         input.data8 = SMC_CMD_READ_KEYINFO
         guard call(&input, &output) == kIOReturnSuccess, output.result == 0,
-              output.keyInfo.dataSize > 0 else { return false }
+              (1...32).contains(output.keyInfo.dataSize),
+              bytes.count == Int(output.keyInfo.dataSize) else { return false }
 
         input.keyInfo.dataSize = output.keyInfo.dataSize
         input.keyInfo.dataType = output.keyInfo.dataType
@@ -151,30 +224,58 @@ final class SMCKit {
 
     // MARK: 고수준 API
 
-    /// fpe2(2비트 소수 고정소수점) 값 → 정수 RPM
-    private func fpe2(_ v: SMCVal?) -> Int? {
-        guard let v = v, v.bytes.count >= 2 else { return nil }
-        let raw = UInt16(v.bytes[0]) << 8 | UInt16(v.bytes[1])
-        return Int(raw) >> 2
+    private func rpm(_ key: String) -> Int? {
+        guard let value = read(key)?.number, (0...30000).contains(value) else { return nil }
+        return Int(value.rounded())
     }
 
-    func fanCount() -> Int {
-        guard let v = read("FNum"), let first = v.bytes.first else { return 0 }
-        return Int(first)
+    func fanCount() -> Int? {
+        guard let value = read("FNum")?.number,
+              (0...16).contains(value), value.rounded() == value else { return nil }
+        return Int(value)
     }
 
-    func fanCurrentRPM(fan: Int) -> Int? { fpe2(read("F\(fan)Ac")) }
-    func fanMinRPM(fan: Int) -> Int?     { fpe2(read("F\(fan)Mn")) }
-    func fanMaxRPM(fan: Int) -> Int?     { fpe2(read("F\(fan)Mx")) }
-    func fanTargetRPM(fan: Int) -> Int?  { fpe2(read("F\(fan)Tg")) }
+    func fanCurrentRPM(fan: Int) -> Int? { rpm("F\(fan)Ac") }
+    func fanMinRPM(fan: Int) -> Int?     { rpm("F\(fan)Mn") }
+    func fanMaxRPM(fan: Int) -> Int?     { rpm("F\(fan)Mx") }
+    func fanTargetRPM(fan: Int) -> Int?  { rpm("F\(fan)Tg") }
 
-    /// sp78(8비트 소수) 온도. 여러 센서 키를 시도해 합리적 값 반환.
-    func cpuTemperature() -> Double? {
-        for key in ["TC0P", "TC0E", "TC0D", "TCXC", "TC0F"] {
-            if let v = read(key), v.bytes.count >= 2 {
-                let t = Double(Int(v.bytes[0])) + Double(Int(v.bytes[1])) / 256.0
-                if t > 0 && t < 150 { return t }
+    func allKeys() -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        if let keys = cachedKeys { return keys }
+        guard let count = read("#KEY")?.number, count > 0, count <= 16384 else { return [] }
+        let keys: [String] = (0..<Int(count)).compactMap { index in
+            var input = SMCKeyData()
+            var output = SMCKeyData()
+            input.data8 = 8  // SMC_CMD_READ_INDEX
+            input.data32 = UInt32(index)
+            guard call(&input, &output) == kIOReturnSuccess, output.result == 0 else { return nil }
+            let bytes = (0..<4).map { UInt8((output.key >> (8 * (3 - $0))) & 0xff) }
+            return String(bytes: bytes, encoding: .ascii)
+        }
+        cachedKeys = keys
+        return keys
+    }
+
+    func cpuTemperature(model: MacModel) -> Double? {
+        lock.lock(); defer { lock.unlock() }
+        if model == .new {
+            if cpuKeys == nil {
+                cpuKeys = allKeys().filter { key in
+                    // M1/M2/M4/M5: Tp/Te. M3의 Tf 센서는 CPU와 GPU를 구분한다.
+                    let m3CPU = ["Tf04", "Tf09", "Tf0A", "Tf0B", "Tf0D", "Tf0E",
+                                 "Tf44", "Tf49", "Tf4A", "Tf4B", "Tf4D", "Tf4E"]
+                    return key.hasPrefix("Tp") || key.hasPrefix("Te") || m3CPU.contains(key)
+                }.sorted()
             }
+            let temperatures = (cpuKeys ?? []).compactMap { read($0)?.number }
+                .filter { $0 > 0 && $0 < 150 }
+            if !temperatures.isEmpty {
+                return temperatures.reduce(0, +) / Double(temperatures.count)
+            }
+        }
+        for key in ["TC0P", "TC0E", "TC0D", "TCXC", "TC0F"] {
+            if let value = read(key)?.number, value > 0, value < 150 { return value }
         }
         return nil
     }
@@ -189,12 +290,61 @@ final class SMCKit {
         return write("FS! ", bytes: [hi, lo])
     }
 
-    /// 팬 목표 RPM 쓰기 (fpe2 = rpm * 4)
+    /// 키 타입에 맞춰 팬 목표 RPM을 쓴다 (Intel fpe2 / Apple Silicon flt).
     @discardableResult
     func setFanTarget(fan: Int, rpm: Int) -> Bool {
-        let raw = rpm * 4
-        let hi = UInt8((raw >> 8) & 0xFF)
-        let lo = UInt8(raw & 0xFF)
-        return write("F\(fan)Tg", bytes: [hi, lo])
+        writeNumber("F\(fan)Tg", value: Double(rpm))
+    }
+
+    private func writeNumber(_ key: String, value: Double) -> Bool {
+        guard let info = read(key), let bytes = info.encoding(value) else { return false }
+        return write(key, bytes: bytes)
+    }
+
+    func fanModeKey(fan: Int) -> String? {
+        ["F\(fan)md", "F\(fan)Md"].first { read($0)?.typeName == "ui8 " }
+    }
+
+    @discardableResult
+    func applyControl(model: MacModel, auto: Bool, rpm: Int = 0) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let count = fanCount(), count > 0 else { return false }
+        var success = true
+
+        if model == .legacy {
+            let mask = auto ? UInt16(0) : UInt16((UInt32(1) << count) - 1)
+            guard setManualMask(mask) else { return false }
+        } else {
+            for fan in 0..<count {
+                guard let key = fanModeKey(fan: fan),
+                      writeNumber(key, value: auto ? 0 : 1) else {
+                    if !auto {
+                        _ = applyControl(model: model, auto: true)
+                        return false
+                    }
+                    // 자동 복귀는 한 팬이 실패해도 나머지 팬까지 모두 시도한다.
+                    success = false
+                    continue
+                }
+            }
+        }
+
+        for fan in 0..<count {
+            // 각 팬의 실제 범위로 제한한다. 좌우 팬의 최대 RPM이 다를 수 있다.
+            let minimum = fanMinRPM(fan: fan) ?? 1200
+            let maximum = fanMaxRPM(fan: fan) ?? 6200
+            let target = auto ? 0 : min(max(rpm, minimum), maximum)
+            // Intel 자동 모드는 FS! 만 초기화한다.
+            if auto && model == .legacy { continue }
+            guard setFanTarget(fan: fan, rpm: target) else {
+                if !auto {
+                    _ = applyControl(model: model, auto: true)
+                    return false
+                }
+                success = false
+                continue
+            }
+        }
+        return success
     }
 }

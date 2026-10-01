@@ -1,4 +1,4 @@
-# FanSpeed v0.2 — 아키텍처 문서
+# FanSpeed v0.3 — 아키텍처 문서
 
 > macOS 메뉴바 팬 속도 제어 앱  
 > 만든이: 월평동 이상목  
@@ -10,6 +10,24 @@
 
 MacBook Pro 11,1 (Intel i5, 2013년)의 팬 소음이 너무 커서  
 메뉴바에서 바로 팬 속도를 모니터링하고 조절하기 위해 제작.
+
+### v0.3: Apple Silicon / Intel 모델 선택 (2026-10-01)
+
+M5 Pro / macOS 26.5.1에서 80바이트 SMC 구조체와 연결 자체는 정상이나,
+RPM은 `fpe2` 대신 little-endian `flt `, CPU 온도는 `TC0P` 대신 `Tp*` 계열이었다.
+모드 키도 `FS! ` 대신 `F0md` / `F1md`였다. 다음 사항을 반영했다.
+
+- `SMCVal`은 키 타입에 따라 `flt `, `fpe2`, signed `sp78`, `ui8/ui16/ui32`를 해석한다. NaN, 무한대, 크기 불일치는 거부하며 0은 유효한 값으로 유지한다.
+- 모델 스위치 ON = New / Apple Silicon, OFF = 이전 / Intel. `hw.optional.arm64`로 최초 감지하고 `com.fanspeed.app`의 `macModel`에 선택을 저장한다.
+- New 모델은 CPU 키를 한 번 탐색·캐시하고 유효한 센서 평균을 읽는다. 이전 모델은 기존 Intel 온도 키를 순서대로 읽는다.
+- `FanReadout`은 팬별 optional RPM으로 읽기 실패와 팬 정지를 구분한다. 팬 2개의 현재 RPM을 표시하며 센서는 2초마다 직렬 큐에서 갱신한다.
+- New 제어는 `Fxmd` / `FxMd`를 탐지해 사용하고 목표 RPM은 실제 데이터 타입으로 인코딩한다. 팬마다 범위를 제한하고 실패 시 자동 복귀를 시도한다. 펌웨어 잠금을 강제 해제하지 않는다.
+- IPC는 `new auto`, `new 2000`, `legacy auto`, `legacy 2000`을 사용한다. 도우미 plist의 `FanSpeedIPCVersion = 2`로 이전 도우미의 업데이트 필요 여부를 확인한다. 이전 GUI의 단일 토큰 명령도 수용한다.
+- 읽기에는 설치 안내가 없다. 최초 수동 제어 때 도우미 설치를 안내한다. 모델 변경·종료 시 앱이 제어한 팬을 자동으로 돌린다.
+- `--diagnose [--model new|legacy]`는 관리자 권한 없이 실제 센서를 JSON으로 출력한다. 빌드는 macOS 11 대상 arm64 + x86_64 Universal 바이너리를 만든다.
+
+이번 실기 검증은 M5 Pro 센서 읽기이며 Intel 실기 및 관리자 권한 팬 쓰기는 다시 시험하지 않았다.
+아래 Intel 키 설명과 기존 설계 이력은 이전 모델의 경로를 설명한다.
 
 ---
 
@@ -23,7 +41,7 @@ MacBook Pro 11,1 (Intel i5, 2013년)의 팬 소음이 너무 커서
 │       ├── 4개 프리셋 버튼               │
 │       ├── VerticalRPMSlider (커스텀)    │
 │       ├── 현재 RPM / CPU 온도 표시      │
-│       └── 자동 시작 토글 / 종료          │
+│       └── 모델 / 자동 시작 토글 / 종료   │
 │                  │                      │
 │       파일 IPC: /Users/Shared/.fanspeed_target
 │                  │                      │
@@ -93,11 +111,11 @@ struct SMCKeyInfoData {
 ### 3-4. fpe2 / sp78 포맷
 
 ```
-fpe2: uint16 빅엔디안, 상위 10비트 = 정수부, 하위 6비트 = 소수부
+fpe2: uint16 빅엔디안, 상위 14비트 = 정수부, 하위 2비트 = 소수부
       읽기: raw >> 2 = RPM
       쓰기: rpm * 4 = raw (hi = raw>>8, lo = raw&0xFF)
 
-sp78: uint16, 상위 8비트 = 정수(°C), 하위 8비트 = 소수 (/ 256)
+sp78: signed int16 빅엔디안 / 256
 ```
 
 ### 3-5. 수동 제어 방법
@@ -118,13 +136,13 @@ F0Md (수동 모드 키)가 이 MacBook Pro 11,1에는 없음 (result=132, not f
 ```
 GUI 앱 (사용자)          데몬 (root)
       │                      │
-      │  echo "3000" >       │
+      │  echo "legacy 3000" >│
       │  /Users/Shared/      │
       │  .fanspeed_target    │
       └────────────────────→ │
-                             │  2초마다 파일 폴링
-                             │  "auto"   → FS!=0 (자동)
-                             │  "3000"   → FS!=1, F0Tg=3000
+                             │  0.3초마다 파일 폴링
+                             │  "legacy auto" → FS!=0 (자동)
+                             │  "legacy 3000" → FS!=1, F0Tg=3000
                              └→ SMCKit.setFanTarget()
 ```
 
@@ -150,7 +168,7 @@ GUI 앱 (사용자)          데몬 (root)
 
 | 파일 | 역할 |
 |------|------|
-| `main.swift` | 진입점. `--daemon` / `--smc-set` / GUI 세 가지 모드 분기 |
+| `main.swift` | 진입점. `--diagnose` / `--daemon` / `--smc-set` / GUI 네 가지 모드 분기 |
 | `SMCKit.swift` | IOKit AppleSMC 저수준 읽기/쓰기 |
 | `FanManager.swift` | 팬 제어 고수준 API, 데몬 설치, LaunchAgent |
 | `AppDelegate.swift` | NSStatusItem, NSPopover, 타이머, 아이콘 |
@@ -162,13 +180,13 @@ GUI 앱 (사용자)          데몬 (root)
 ## 7. 빌드
 
 ```bash
-cd /Volumes/MACD/AI_Work1/FanSpeed
 bash build.sh
 ./FanSpeed
 ```
 
 의존성 없음. 표준 macOS SDK만 사용 (AppKit + IOKit + Foundation).  
 Xcode 불필요, `swiftc` CLI로 컴파일.
+`bash test.sh`로 데이터 변환, IPC, 표시와 모델 선택 저장을 검증한다.
 
 ---
 
@@ -179,6 +197,7 @@ Xcode 불필요, `swiftc` CLI로 컴파일.
 | v0.1 | 2026-06-07 | 초기 완성. SMC 읽기 버그(구조체 패딩) 수정, FS!/F0Tg 제어 구현 |
 | v0.2 | 2026-06-07 | 파란 아이콘, 메뉴바 RPM 표시, 팝오버 즉시 표시, 최초 데몬 자동 설치 안내, 텍스트 잘림 수정 |
 | v0.2.1 | 2026-06-07 | 슬라이더 1 RPM 미세 조절, 중복 실행 차단, 데몬 폴링 0.3초로 단축, sticky-dir IPC 버그 수정 |
+| v0.3 | 2026-10-01 | New/이전 모델 스위치, M5 float RPM 및 CPU 센서, 두 팬 표시, 모델별 제어/IPC, 읽기 전용 진단, Universal 빌드 |
 
 ---
 
@@ -208,12 +227,13 @@ GUI 앱(사용자 권한)과 SMC 쓰기 권한(root)을 **시간적으로 분리
 - **1회만 비밀번호 입력**: 최초 데몬 설치 시 `osascript ... with administrator privileges` 로 1번. 이후 LaunchDaemon이 부팅마다 자동 root 실행.
 - **이후 모든 제어는 파일 쓰기**: 일반 사용자 권한으로 666 파일에 RPM을 write → 데몬이 0.3초 폴링으로 감지 → root 권한으로 SMC에 반영.
 
-### 9-3. 단일 바이너리 3-모드 분기
+### 9-3. 단일 바이너리 모드 분기
 
-같은 실행 파일이 인자에 따라 GUI/데몬/CLI 세 가지 역할을 한다.
+같은 실행 파일이 인자에 따라 GUI/데몬/CLI/읽기 전용 진단 역할을 한다.
 
 ```swift
 // main.swift
+if args.contains("--diagnose")      { /* 센서 JSON 출력 후 종료 */ }
 if args.contains("--daemon")        { FanManager.runDaemon() }   // root, 무한 루프
 if args.contains("--smc-set")       { exit(FanManager.runCLI(...)) } // root, 1회 쓰기
 // 그 외: GUI 메뉴바 앱
